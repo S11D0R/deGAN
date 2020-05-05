@@ -1,29 +1,131 @@
+import os
 import keras
-from keras.layers import Conv2D, Flatten, Dropout
+import numpy as np
+import matplotlib.pyplot as plt
+from keras import Sequential, initializers, Input, Model
+from keras.datasets import fashion_mnist
+from keras.layers import Conv2D, Flatten, Dropout, LeakyReLU
 from keras.layers import MaxPooling2D
 from keras.layers import Dense
-fashion_mnist = keras.datasets.fashion_mnist
-(train_images, train_labels), (test_images, test_labels) = fashion_mnist.load_data()
-class_names = ['T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat', 'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot']
-train_images = train_images / 255.0
-test_images = test_images / 255.0
-train_images = train_images.reshape(60000, 28, 28, 1)
-test_images = test_images.reshape(10000, 28, 28, 1)
-model = keras.Sequential()
-model.add(Conv2D(64, (3, 3), padding='same', activation='relu'))
-model.add(Conv2D(64, (3, 3), padding='same', activation='relu'))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-#model.add(Dropout(0.5))
-model.add(Conv2D(128, (3, 3), padding='same', activation='relu'))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-#model.add(Dropout(0.5))
-model.add(Flatten())
-model.add(Dense(10, activation='softmax'))
-model.compile(optimizer='adam',
-              loss='sparse_categorical_crossentropy',
-              metrics=['accuracy'])
+from tqdm import tqdm
 
-model.fit(train_images, train_labels, epochs=3)
-test_loss, test_acc = model.evaluate(test_images,  test_labels, verbose=2)
-print('\nТочность на проверочных данных:', test_acc)
-predictions = model.predict(test_images)
+# Let Keras know that we are using tensorflow as our backend engine
+from keras.optimizers import Adam
+
+os.environ["KERAS_BACKEND"] = "tensorflow"
+# To make sure that we can reproduce the experiment and get the same results
+np.random.seed(10)
+# The dimension of our random noise vector.
+random_dim = 100
+
+def get_optimizer():
+    return Adam(lr=0.0002, beta_1=0.5)
+
+def get_generator(optimizer):
+    generator = Sequential()
+    generator.add(Dense(256, input_dim=random_dim, kernel_initializer=initializers.RandomNormal(stddev=0.02)))
+    generator.add(LeakyReLU(0.2))
+    generator.add(Dense(512))
+    generator.add(LeakyReLU(0.2))
+    generator.add(Dense(1024))
+    generator.add(LeakyReLU(0.2))
+    generator.add(Dense(784, activation='tanh'))
+    generator.compile(loss='binary_crossentropy', optimizer=optimizer)
+    return generator
+
+def get_discriminator(optimizer):
+    discriminator = Sequential()
+    discriminator.add(Dense(1024, input_dim=784, kernel_initializer=initializers.RandomNormal(stddev=0.02)))
+    discriminator.add(LeakyReLU(0.2))
+    discriminator.add(Dropout(0.3))
+    discriminator.add(Dense(512))
+    discriminator.add(LeakyReLU(0.2))
+    discriminator.add(Dropout(0.3))
+    discriminator.add(Dense(256))
+    discriminator.add(LeakyReLU(0.2))
+    discriminator.add(Dropout(0.3))
+    discriminator.add(Dense(1, activation='sigmoid'))
+    discriminator.compile(loss='binary_crossentropy', optimizer=optimizer)
+
+def get_gan_network(discriminator, random_dim, generator, optimizer):
+    # We initially set trainable to False since we only want to train either the
+    # generator or discriminator at a time
+    # discriminator.trainable = False
+    # gan input (noise) will be 100-dimensional vectors
+    gan_input = Input(shape=(random_dim,))
+    # the output of the generator (an image)
+    x = generator(gan_input)
+    # get the output of the discriminator (probability if the image is real or not)
+    gan_output = discriminator(x)
+    gan = Model(inputs=gan_input, outputs=gan_output)
+    gan.compile(loss='binary_crossentropy', optimizer=optimizer)
+    return gan
+
+def plot_generated_images(epoch, generator, examples=100, dim=(10, 10), figsize=(10, 10)):
+    noise = np.random.normal(0, 1, size=[examples, random_dim])
+    generated_images = generator.predict(noise)
+    generated_images = generated_images.reshape(examples, 28, 28)
+
+    plt.figure(figsize=figsize)
+    for i in range(generated_images.shape[0]):
+        plt.subplot(dim[0], dim[1], i+1)
+        plt.imshow(generated_images[i], interpolation='nearest', cmap='gray_r')
+        plt.axis('off')
+    plt.tight_layout()
+    plt.savefig('gan_generated_image_epoch_%d.png' % epoch)
+
+def load_minst_data():
+    # load the data
+    (x_train, y_train), (x_test, y_test) = fashion_mnist.load_data()
+    # normalize our inputs to be in the range[-1, 1]
+    x_train = x_train.astype(np.float32) / 255.0
+    # convert x_train with a shape of (60000, 28, 28) to (60000, 784) so we have
+    # 784 columns per row
+    x_train = x_train.reshape(60000, 784)
+    return (x_train, y_train, x_test, y_test)
+
+
+
+def mtrain(epochs=1, batch_size=128):
+    # Get the training and testing data
+    x_train, y_train, x_test, y_test = load_minst_data()
+    # Split the training data into batches of size 128
+    batch_count = x_train.shape[0] // batch_size
+
+    # Build our GAN netowrk
+    adam = get_optimizer()
+    generator = get_generator(adam)
+    discriminator = get_discriminator(adam)
+    gan = get_gan_network(discriminator, random_dim, generator, adam)
+
+    for e in range(1, epochs+1):
+        print('-' * 15, 'Epoch %d' % e, '-' * 15)
+        for _ in tqdm(range(batch_count)):
+            # Get a random set of input noise and images
+            noise = np.random.normal(0, 1, size=[batch_size, random_dim])
+            image_batch = x_train[np.random.randint(0, x_train.shape[0], size=batch_size)]
+
+            # Generate fake MNIST images
+            generated_images = generator.predict(noise)
+            X = np.concatenate([image_batch, generated_images])
+
+            # Labels for generated and real data
+            y_dis = np.zeros(2*batch_size)
+            # One-sided label smoothing
+            y_dis[:batch_size] = 0.9
+
+            # Train discriminator
+            discriminator.trainable = True
+            discriminator.train_on_batch(X, y_dis)
+
+            # Train generator
+            noise = np.random.normal(0, 1, size=[batch_size, random_dim])
+            y_gen = np.ones(batch_size)
+            discriminator.trainable = False
+            gan.train_on_batch(noise, y_gen)
+
+        if e == 1 or e % 20 == 0:
+            plot_generated_images(e, generator)
+
+if __name__ == '__main__':
+    mtrain(400, 128)
